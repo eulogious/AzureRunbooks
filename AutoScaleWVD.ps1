@@ -5,64 +5,151 @@
 
 .DESCRIPTION
     This powershell script does the following:
-        Automatically start and stop session hosts in the WVD environment based on the number of users logged in. 
-        Determines the number of servers that are required to be running to meet the specifications outlined.
+        Automatically start and stop session hosts in the WVD environment based on the number of users logged in
+        Determines the number of servers that are required to be running to meet the specifications outlined
             (number is divided by the definition of maximum session set as defined in the depth-first load balancing settings for the pool) 
-            Session hosts are scaled up or down based on that metric.
+        Session hosts are scaled up or down based on that metric
     
-    Requirements for script to function:
-    
-        An Azure Automation and Azure Function service.
-        Azure Automation account needs the following added PowerShell modules
+.REQUIREMENTS    
+        An Azure Automation Account
+        RunAsAccount for the Automation Account
+        A runbook with an enabled webhook
+        The corresponding secret url for the webhook
+        An Azure Logic App configured to manipulate the runbook via the webhook
+        WVD Host Pool must be configured for Depth First load balancing
+        The RunAsAccount for the Automation Account must be in a "RDS Contributor" role for the WVD Tenant
+        Azure Automation Account runbook needs the following added PowerShell modules:
             Az.account, Az.compute, and Microsoft.RDInfra.RDPowershell
-        WVD Pool must be configured in a Depth First setting.
-        A Service Principal with contributor rights to the WVD resource pool associated to the WVD pool.
-        Credential object associated to the runbook in the Automation account (service principal account as created above
-        application ID is username and secret is pw)
-        For best results set a GPO for the session hosts to log out disconnected and idle sessions
-        Azure blob storage account for logging
+
+.LOGIC_APP_EXAMPLE
+    {
+        "definition": { 
+            "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+            "actions": {
+                "HTTP_Webhook": {
+                    "inputs": {
+                        "subscribe": {
+                            "body": {
+                                "ConnectionAssetName": "<RunAsConnectionName>",
+                                "RDBrokerURL": "https://rdbroker.wvd.microsoft.com",
+                                "aadTenantId": "<AADTenant>",
+                                "azureSubId": "<AzureSubscriptionId>",
+                                "callbackUrl": "@{listCallbackUrl()}",
+                                "endPeakTime": "18:00:00",
+                                "hostpoolname": "<WVDHostPoolName>",
+                                "peakServerStartThreshold": "2",
+                                "peakday": [
+                                    "Monday",
+                                    "Tuesday",
+                                    "Wednesday",
+                                    "Thursday",
+                                    "Friday"
+                                ],
+                                "serverStartThreshold": "1",
+                                "sessionHostRg": "<WVDHostPoolResourceGroup>",
+                                "startPeakTime": "06:00:00",
+                                "tenantName": "<WVDTenantName>",
+                                "usePeak": "yes",
+                                "utcoffset": "-7"
+                            },
+                            "method": "POST",
+                            "uri": "<RunbookWebhookUrl>"
+                        },
+                        "unsubscribe": {}
+                    },
+                    "runAfter": {},
+                    "type": "HttpWebhook"
+                }
+            },
+            "contentVersion": "1.0.0.0",
+            "outputs": {},
+            "parameters": {},
+            "triggers": {
+                "Recurrence": {
+                    "recurrence": {
+                        "frequency": "Minute",
+                        "interval": 5
+                    },
+                    "type": "Recurrence"
+                }
+            }
+        },
+        "parameters": {}
+    }
 
 .NOTES 
-    Author:       Kandice Hendricks
-    Version:      1.0.0     Initial Build Travis Roberts see here for his information https://www.ciraltos.com/automatically-start-and-stop-wvd-vms-with-azure-automation/
-                  1.0.1     Added while loop statements in power on and power off metrics
-                                changed failing status on offservers to be anything not equal to running status
-                  2.0.0     Call StartSession and StopSession function once, loop through hosts until threshold is met
-                  2.0.1     Changed Write variables to output so they are logged in the Azure Runbook logs and are  
-                            easier to push to Azure Analytics and report out against to management for cost savings
-    #>
+    Author:       Donald Harris
+    Version:      1.0.0     Initial Build Kandice Hendricks see here for her information https://github.com/KandiceLynne/AzureRunbooks
+                  1.0.1     Implemented logic app manipulating a runbook webhook to feed the variables in this script
+                  1.0.2     Fixed typos, fixed up time, and other random bug fixes
+                  2.0.0     Removed all hard coded references, they all now use the data from the webhook
 
-    #######       Section for Variables       #######
+#>
 
-    # Host start threshold meaning the number of available session to trigger a host start or shutdown
-        $serverStartThreshold = 4
+    #######       Get data from webhook body    #############
+        param(
+	        [Parameter(mandatory = $false)]
+	        [object]$WebHookData
+        )
+        # If runbook was called from Webhook, WebhookData will not be null.
+        if ($WebHookData) {
 
-    # Peak time and Threshold 
-    # Set the usePeak (yes or no)
-    # Modifiy the peak threshold, start, stop and peakDays if desired
-    # Set time to utcoffset to your timezone
-        $usePeak = "yes"
-        $peakServerStartThreshold = 4
-        $startPeakTime = '08:00:00'
-        $endPeakTime = '18:00:00'
-        $utcoffset = '-4'
-        $peakDay = 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday'
+	        # Collect properties of WebhookData
+	        $WebhookName = $WebHookData.WebhookName
+	        $WebhookHeaders = $WebHookData.RequestHeader
+	        $WebhookBody = $WebHookData.RequestBody
 
-    # Settings for your environment note the variables should be 
-    # Azure automation encrypted variables for TenantID and Subscription ID
-        $aadTenantId = Get-AutomationVariable -Name 'aadTenantId'
-        $azureSubId = Get-AutomationVariable -Name 'azureSubId'
+	        # Collect individual headers. Input converted from JSON.
+	        $From = $WebhookHeaders.From
+	        $Input = (ConvertFrom-Json -InputObject $WebhookBody)
+        }
+        else
+        {
+	        Write-Error -Message 'Runbook was not started from Webhook' -ErrorAction stop
+        }
 
-   # Host Resource Group
-        $sessionHostRg = 'your-wvd-resource-group'
-
-   # Tenant Name
-        $tenantName = 'your-wvd-tenant-name'
-
-   # Host Pool Name
-        $hostPoolName = 'your-wvd-pool-name'
+    #######       Translate Webhook Data into Variables       #######
+        $serverStartThreshold = $Input.serverStartThreshold
+        $usePeak = $Input.usePeak
+        $peakServerStartThreshold = $Input.peakServerStartThreshold
+        $startPeakTime = $Input.startPeakTime
+        $endPeakTime = $Input.endPeakTime
+        $utcoffset = $Input.utcoffset
+        $peakDay = $Input.peakDay 
+        $aadTenantId = $Input.aadTenantId
+        $azureSubId = $Input.azureSubId
+        $sessionHostRg = $Input.sessionHostRg 
+        $tenantName = $Input.tenantName
+        $hostPoolName = $Input.hostpoolname
+        $ConnectionAssetName = $Input.ConnectionAssetName
+        $rdbroker = $Input.RDBrokerURL
+        $callbackurl = $Input.callbackUrl
 
    #######       Section for Functions       ####### 
+
+    #Convert UTC to Local Time
+
+      function Convert-UTCtoLocalTime
+    {
+	    param(
+		    $TimeDifferenceInHours
+	)
+
+	    $UniversalTime = (Get-Date).ToUniversalTime()
+	    $TimeDifferenceMinutes = 0
+	    if ($TimeDifferenceInHours -match ":") {
+		    $TimeDifferenceHours = $TimeDifferenceInHours.Split(":")[0]
+		    $TimeDifferenceMinutes = $TimeDifferenceInHours.Split(":")[1]
+	    }
+	    else {
+		    $TimeDifferenceHours = $TimeDifferenceInHours
+	    }
+	    #Azure is using UTC time, justify it to the local time
+	    $ConvertedTime = $UniversalTime.AddHours($TimeDifferenceHours).AddMinutes($TimeDifferenceMinutes)
+	    return $ConvertedTime
+    }
+
+    #Start Session Host
 
       function Start-SessionHost 
     {
@@ -95,8 +182,8 @@
                 try
                 {  
                     # Start the VM
-                    $creds = Get-AutomationPSCredential -Name 'WVD-AutoScale-cred'  
-                    Connect-AzAccount -ErrorAction Stop -ServicePrincipal -SubscriptionId $azureSubId -TenantId $aadTenantId -Credential $creds
+                    $Connection = Get-AutomationConnection -Name $ConnectionAssetName
+                    Connect-AzAccount -ErrorAction Stop -ServicePrincipal -SubscriptionId $azureSubId -TenantId $aadTenantId  -ApplicationId $Connection.ApplicationId -CertificateThumbprint $Connection.CertificateThumbprint
                     $vmName = $startServerName.Split('.')[0]
                     Start-AzVM -ErrorAction Stop -ResourceGroupName $sessionHostRg -Name $vmName
                 }
@@ -111,6 +198,8 @@
         }
     }
 
+
+#Stop Session Host
 function Stop-SessionHost 
 {
    param 
@@ -138,8 +227,8 @@ function Stop-SessionHost
             try 
                 {
                 # Stop the VM
-                $creds = Get-AutomationPSCredential -Name 'WVD-AutoScale-cred'
-                Connect-AzAccount -ErrorAction Stop -ServicePrincipal -SubscriptionId $azureSubId -TenantId $aadTenantId -Credential $creds
+                $Connection = Get-AutomationConnection -Name $ConnectionAssetName
+                Connect-AzAccount -ErrorAction Stop -ServicePrincipal -SubscriptionId $azureSubId -TenantId $aadTenantId  -ApplicationId $Connection.ApplicationId -CertificateThumbprint $Connection.CertificateThumbprint
                 $vmName = $shutServerName.Split('.')[0]
                 Stop-AzVM -ErrorAction Stop -ResourceGroupName $sessionHostRg -Name $vmName -Force
                 }
@@ -159,9 +248,8 @@ function Stop-SessionHost
 ## Log into Azure WVD
 try 
 {
-    $creds = Get-AutomationPSCredential -Name 'WVD-AutoScale-cred'
-    Add-RdsAccount -ErrorAction Stop -DeploymentUrl "https://rdbroker.wvd.microsoft.com" -Credential $creds -ServicePrincipal -AadTenantId $aadTenantId
-    Write-Output Get-RdsContext | Out-String
+    $Connection = Get-AutomationConnection -Name $ConnectionAssetName
+    Add-RdsAccount -ErrorAction Stop -DeploymentUrl $rdbroker -ApplicationId $Connection.ApplicationId -CertificateThumbprint $Connection.CertificateThumbprint -AadTenantId $aadTenantId
 }
 catch 
 {
@@ -192,21 +280,25 @@ if ($hostPool.LoadBalancerType -ne "DepthFirst")
 }
 
 ## Check if peak time and adjust threshold
-    $date = ((get-date).ToUniversalTime()).AddHours($utcOffset)
-    $dateTime = ($date.hour).ToString() + ':' + ($date.minute).ToString() + ':' + ($date.second).ToString()
-    Write-Output "Date and Time"
+    # Converting date time from UTC to Local
+	$dateTime = Convert-UTCtoLocalTime -TimeDifferenceInHours $utcoffset
+    $BeginPeakDateTime = [datetime]::Parse($dateTime.ToShortDateString() + ' ' + $startPeakTime)
+	$EndPeakDateTime = [datetime]::Parse($dateTime.ToShortDateString() + ' ' + $EndPeakTime)
+    Write-Output "Current Day, Date, and Time:"
     Write-Output $dateTime
     $dateDay = (((get-date).ToUniversalTime()).AddHours($utcOffset)).dayofweek
-    Write-Output $dateDay
-if ($dateTime -gt $startPeakTime -and $dateTime -lt $endPeakTime -and $dateDay -in $peakDay -and $usePeak -eq "yes") 
-    { Write-Output "Adjusting threshold for peak hours" 
+    #Write-Output $dateDay
+if ($dateTime -gt $BeginPeakDateTime -and $dateTime -lt $EndPeakDateTime -and $dateDay -in $peakDay -and $usePeak -eq "yes") 
+    { Write-Output "Threshold set for peak hours" 
     $serverStartThreshold = $peakServerStartThreshold }
+else 
+    { Write-Output "Thershold set for outside of peak hours" }
+
 
 ## Get the Max Session Limit on the host pool
 ## This is the total number of sessions per session host
     $maxSession = $hostPool.MaxSessionLimit
-    Write-Output "MaxSession:"
-    Write-Output $maxSession
+    Write-Output "MaxSession: $maxSession"
 
 # Find the total number of session hosts
 # Exclude servers that do not allow new connections
@@ -228,14 +320,13 @@ foreach ($sessionHost in $sessionHosts)
    $count = $sessionHost.sessions
    $currentSessions += $count
 }
-    Write-Output "CurrentSessions"
-    Write-Output $currentSessions
+    Write-Output "CurrentSessions: $currentSessions"
 
 ## Number of running and available session hosts
 ## Host that are shut down are excluded
     $runningSessionHosts = $sessionHosts | Where-Object { $_.Status -eq "Available" }
     $runningSessionHostsCount = $runningSessionHosts.count
-    Write-Output "Running Session Host $runningSessionHostsCount"
+    Write-Output "Running Session Host: $runningSessionHostsCount"
     Write-Output ($runningSessionHosts | Out-string)
 
 # Target number of servers required running based on active sessions, Threshold and maximum sessions per host
@@ -243,17 +334,20 @@ foreach ($sessionHost in $sessionHosts)
 
 if ($runningSessionHostsCount -lt $sessionHostTarget) 
 {
-   Write-Output "Running session host count $runningSessionHosts is less than session host target count $sessionHostTarget, starting sessions"
+   Write-Output "Running session host count $runningSessionHostsCount is less than session host target count $sessionHostTarget, starting sessions"
    $sessionsToStart = ($sessionHostTarget - $runningSessionHostsCount)
    Start-SessionHost -Sessionhosts $sessionHosts -sessionsToStart $sessionsToStart
+   Invoke-RestMethod -Method Post -Uri $callbackurl
 }
 elseif ($runningSessionHostsCount -gt $sessionHostTarget) 
 {
    Write-Output "Running session hosts count $runningSessionHostsCount is greater than session host target count $sessionHostTarget, stopping sessions"
    $sessionsToStop = ($runningSessionHostsCount - $sessionHostTarget)
    Stop-SessionHost -SessionHosts $sessionHosts -sessionsToStop $sessionsToStop
+   Invoke-RestMethod -Method Post -Uri $callbackurl
 }
 else 
 {
- Write-Output "Running session host count $runningSessionHostsCount matches session host target count $sessionHostTarget, doing nothing"   
+ Write-Output "Running session host count $runningSessionHostsCount matches session host target count $sessionHostTarget, doing nothing" 
+ Invoke-RestMethod -Method Post -Uri $callbackurl  
 }
