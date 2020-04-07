@@ -282,7 +282,7 @@ if ($hostPool.LoadBalancerType -ne "DepthFirst")
 ## Check if peak time and adjust threshold
     # Converting date time from UTC to Local
 	$dateTime = Convert-UTCtoLocalTime -TimeDifferenceInHours $utcoffset
-    $BeginPeakDateTime = [datetime]::Parse($dateTime.ToShortDateString() + ' ' + $startPeakTime)
+    	$BeginPeakDateTime = [datetime]::Parse($dateTime.ToShortDateString() + ' ' + $startPeakTime)
 	$EndPeakDateTime = [datetime]::Parse($dateTime.ToShortDateString() + ' ' + $EndPeakTime)
     Write-Output "Current Day, Date, and Time:"
     Write-Output $dateTime
